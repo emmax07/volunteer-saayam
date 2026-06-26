@@ -10,12 +10,20 @@ env:
   APP_NAME: volunteer-app
   AWS_REGION: us-east-1
   S3_BUCKET: saayam-virginia-private
+  # Replace with your actual IAM Role ARN configured for GitHub OIDC Federation
+  AWS_ROLE_ARN: arn:aws:iam::123456789012:role/github-actions-volunteer-app
+
+# Default permissions to secure the GITHUB_TOKEN against exploit attempts
+permissions:
+  contents: read
 
 jobs:
-  # JOB 0: SECURITY SCAN()
+  # JOB 0: SECURITY SCAN
   security-scan:
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: read
+      actions: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -33,7 +41,7 @@ jobs:
         with:
           name: gitleaks-report
           path: gitleaks-report.json
-  
+
   # JOB 1: Continuous Integration (Compile, Test, Quality Scans)
   build-and-test:
     needs: security-scan
@@ -58,7 +66,7 @@ jobs:
           key: ${{ runner.os }}-sonar
           restore-keys: ${{ runner.os }}-sonar
 
-      # Builds and compiles. Note: Ensure your local Test file contains the H2/mock profiles
+      # Builds and compiles.
       - name: Build and Verify with Maven
         run: mvn clean verify
 
@@ -87,6 +95,9 @@ jobs:
     needs: build-and-test
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # CRITICAL: Required for obtaining AWS OIDC JWT tokens safely
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -94,23 +105,29 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Extract version from pom.xml
+      - name: Extract and Validate version from pom.xml
         id: ver
         shell: bash
         run: |
           VERSION_RAW=$(grep -E '<version>.*</version>' pom.xml | grep -v '<modelVersion>' | head -n1 | sed -E 's/.*<version>([^<]+)<\/version>.*/\1/')
+
+          # Security Validation: Enforce clean version names to eliminate script execution vectors
+          if [[ ! "$VERSION_RAW" =~ ^[0-9a-zA-Z._-]+$ ]]; then
+            echo "::error::Security Hazard - Untrusted project version formatting discovered."
+            exit 1
+          fi
+
           VERSION_STRIPPED=$(echo "$VERSION_RAW" | sed 's/-SNAPSHOT$//')
           DATE_UTC=$(date -u +%Y%m%d-%H%M)
           VERSION_TAG="v${VERSION_STRIPPED}-${DATE_UTC}"
           echo "version=${VERSION_TAG}" >> $GITHUB_OUTPUT
           echo "archive=${{ env.APP_NAME }}-${VERSION_TAG}.tar.gz" >> $GITHUB_OUTPUT
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (via Secure OIDC Federation)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_VOLUNTEER }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_VOLUNTEER }}
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
 
       # --- BRANCH STRATEGY 1: TEST BRANCH DEPLOYMENT ---
       - name: Deploy to Test Environment (Simulated Netlify/S3 API)
@@ -159,7 +176,7 @@ jobs:
           fi
           echo "Running E2E validation tests against $TARGET_URL"
 
-      # Safe cleanup mechanism for old images
+      # Cleanup mechanism for old version images via AWS CLI
       - name: Keep only last 3 versioned images
         if: github.ref_name == 'dev'
         shell: bash
